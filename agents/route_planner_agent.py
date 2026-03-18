@@ -2,7 +2,12 @@
 Route Planning Agent
 --------------------
 Receives bin status/alert messages, maintains a live map of fill levels,
-and dispatches optimised collection routes to the Waste Truck Agent.
+and dispatches optimised collection routes to the Waste Truck Agent
+OR directly to a human truck driver via XMPP chat.
+
+Mode is controlled by DRIVER_MODE in config.py:
+  False → machine-readable pipe-separated routes (autonomous truck agent)
+  True  → human-readable plain-text routes (driver receives on phone)
 """
 
 import math
@@ -12,10 +17,11 @@ from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour
 from spade.message import Message
 
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import DRIVER_MODE, SCHEDULE_THRESHOLD, URGENT_THRESHOLD
 
-SCHEDULE_THRESHOLD  = 70    # % fill — include bin in next route
-URGENT_THRESHOLD    = 80    # % fill — trigger immediate route dispatch
-RECEIVE_TIMEOUT     = 20    # seconds to wait for an incoming message
+RECEIVE_TIMEOUT = 20    # seconds to wait for an incoming message
 
 
 def haversine(lat1, lon1, lat2, lon2) -> float:
@@ -33,8 +39,8 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 class RoutePlannerAgent(Agent):
     """
     Prometheus Agent Type: Route Planning Agent
-    Percepts  : BIN_STATUS and BIN_ALERT messages
-    Actions   : Compute optimised route, send ROUTE_UPDATE to truck
+    Percepts  : BIN_STATUS, BIN_ALERT, and DONE replies (driver mode)
+    Actions   : Compute optimised route, send ROUTE_UPDATE to truck or driver
     Beliefs   : bin_map — current state of every known bin
     """
 
@@ -47,7 +53,7 @@ class RoutePlannerAgent(Agent):
     # ------------------------------------------------------------------ #
     #  Route optimisation — nearest-neighbour heuristic                   #
     # ------------------------------------------------------------------ #
-    def optimise_route(self) -> list[dict]:
+    def optimise_route(self) -> list:
         """
         Select bins at or above SCHEDULE_THRESHOLD and sort them by
         a nearest-neighbour greedy algorithm starting from the depot
@@ -90,12 +96,51 @@ class RoutePlannerAgent(Agent):
             "updated":  datetime.now().isoformat(),
         }
 
-    def encode_route(self, route: list[dict]) -> str:
-        """Serialise route as pipe-separated stop records."""
-        return ";".join(
-            f"{s['bin_id']}|{s['location']}|{s['lat']}|{s['lon']}|{s['fill']}"
-            for s in route
-        )
+    def encode_route(self, route: list) -> str:
+        """
+        Serialise the route for the receiver.
+
+        DRIVER_MODE = True  → human-readable plain-text chat message
+        DRIVER_MODE = False → pipe/semicolon-separated string for
+                              the autonomous Waste Truck Agent to parse
+        """
+        if DRIVER_MODE:
+            lines = ["🚛 *Collection Route* — please collect in this order:\n"]
+            for i, s in enumerate(route, 1):
+                lines.append(
+                    f"{i}. {s['location']} — Bin {s['bin_id']} "
+                    f"({s['fill']}% full)"
+                )
+            lines.append(
+                "\nReply *DONE bin_XXX* after each collection "
+                "(e.g. DONE bin_001)."
+            )
+            return "\n".join(lines)
+        else:
+            return ";".join(
+                f"{s['bin_id']}|{s['location']}|{s['lat']}|{s['lon']}|{s['fill']}"
+                for s in route
+            )
+
+    def handle_driver_reply(self, body: str):
+        """
+        Parse a manual DONE confirmation from the driver.
+        Format expected: 'DONE bin_XXX'
+        Sets that bin's fill to 0 in the belief base.
+        """
+        parts = body.strip().upper().split()
+        if len(parts) == 2 and parts[0] == "DONE":
+            bin_id = parts[1].lower()
+            if bin_id in self.bin_map:
+                self.bin_map[bin_id]["fill"] = 0
+                print(
+                    f"[RoutePlanner] Driver confirmed collection of "
+                    f"{bin_id} — belief base updated (fill → 0%)."
+                )
+            else:
+                print(
+                    f"[RoutePlanner] Received DONE for unknown bin: {bin_id}"
+                )
 
     # ------------------------------------------------------------------ #
     #  Behaviour: react to every incoming message                         #
@@ -107,6 +152,12 @@ class RoutePlannerAgent(Agent):
                 return
 
             perf = msg.get_metadata("performative")
+
+            # ── Driver DONE reply (plain-text, no performative) ────────
+            if DRIVER_MODE and (not perf or perf == "chat"):
+                self.agent.handle_driver_reply(msg.body)
+                return
+
             parts = msg.body.split("|")
 
             # ── PERCEIVE ──────────────────────────────────────────────
@@ -127,9 +178,11 @@ class RoutePlannerAgent(Agent):
                 or fill >= URGENT_THRESHOLD
             )
 
+            mode_label = "DRIVER" if DRIVER_MODE else "AGENT"
             print(
                 f"[RoutePlanner] Received {perf}: "
-                f"{bin_id} @ {fill}% — dispatch_now={dispatch_now}"
+                f"{bin_id} @ {fill}% — dispatch_now={dispatch_now} "
+                f"[{mode_label} MODE]"
             )
 
             if dispatch_now:
@@ -152,5 +205,6 @@ class RoutePlannerAgent(Agent):
                 )
 
     async def setup(self):
-        print("[RoutePlanner] Agent starting …")
+        mode_label = "DRIVER" if DRIVER_MODE else "AGENT"
+        print(f"[RoutePlanner] Agent starting … [{mode_label} MODE]")
         self.add_behaviour(self.PlanBehaviour())

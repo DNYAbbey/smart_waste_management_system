@@ -7,27 +7,46 @@ Runs without a live XMPP server by replacing SPADE messaging with
 asyncio Queues, so you can test the full perceive→decide→act loop
 directly from the terminal.
 
+TWO MODES — controlled by the DRIVER_MODE flag imported from
+agents/route_planner_agent.py:
+
+  DRIVER_MODE = False  →  AGENT MODE
+      The autonomous waste_truck coroutine runs, parses the route,
+      drives to each stop, and sends COLLECTION_DONE confirmations.
+
+  DRIVER_MODE = True   →  DRIVER MODE
+      The truck coroutine is replaced by a simulated_driver coroutine
+      that prints the human-readable route message (exactly as a real
+      driver would see it on their phone), waits a moment, then sends
+      DONE bin_XXX replies back to the planner — simulating a driver
+      tapping out confirmations after each collection.
+
 Usage:
     python simulation.py
 
 Dependencies:
-    pip install spade          # for the real multi-agent run (main.py)
     # No extra packages needed for this simulation
 """
 
 import asyncio
 import random
 import math
+import sys
+import os
 from datetime import datetime
+
+# Import DRIVER_MODE from the agent so the simulation always stays in sync
+sys.path.insert(0, os.path.dirname(__file__))
+from config import DRIVER_MODE, SCHEDULE_THRESHOLD
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Shared in-process message bus (replaces XMPP for simulation)
 # ══════════════════════════════════════════════════════════════════════════════
 
-planner_inbox: asyncio.Queue = None   # Bin Sensor → Route Planner
-truck_inbox:   asyncio.Queue = None   # Route Planner → Truck
-done_inbox:    asyncio.Queue = None   # Truck → Route Planner (confirmations)
+planner_inbox: asyncio.Queue = None   # Bin Sensor  → Route Planner
+truck_inbox:   asyncio.Queue = None   # Route Planner → Truck / Driver
+done_inbox:    asyncio.Queue = None   # Truck / Driver → Route Planner
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -42,24 +61,29 @@ BINS = {
     "bin_005": {"location": "Kaneshie Mkt",   "lat": 5.5728, "lon": -0.2360, "fill": random.randint(10, 95)},
 }
 
-ALERT_THRESHOLD    = 80
-SCHEDULE_THRESHOLD = 70
-SENSE_PERIOD       = 3    # seconds (fast for simulation)
-TRAVEL_SECONDS     = 1    # seconds per stop (simulated)
-CYCLES             = 6    # how many sense cycles to run
+ALERT_THRESHOLD = 80
+SENSE_PERIOD    = 3    # seconds (fast for simulation)
+TRAVEL_SECONDS  = 1    # seconds per stop (simulated)
+REPLY_DELAY     = 1    # seconds driver takes to type a DONE reply
+CYCLES          = 6    # sense cycles per sensor
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Utilities
+#  Terminal colours
 # ══════════════════════════════════════════════════════════════════════════════
 
 CYAN   = "\033[96m"
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 RED    = "\033[91m"
+BLUE   = "\033[94m"
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Utilities
+# ══════════════════════════════════════════════════════════════════════════════
 
 def haversine(lat1, lon1, lat2, lon2) -> float:
     R = 6371
@@ -85,15 +109,31 @@ def nearest_neighbour(candidates: list, depot=(5.6037, -0.1870)) -> list:
     return route
 
 
+def format_route_human(route: list) -> str:
+    """Format route exactly as the driver sees it on their phone."""
+    lines = ["🚛 Collection Route — please collect in this order:\n"]
+    for i, s in enumerate(route, 1):
+        lines.append(
+            f"  {i}. {s['location']} — Bin {s['bin_id']} ({s['fill']}% full)"
+        )
+    lines.append("\nReply DONE bin_XXX after each collection (e.g. DONE bin_001).")
+    return "\n".join(lines)
+
+
+def format_route_machine(route: list) -> str:
+    """Pipe-separated format consumed by the autonomous Waste Truck Agent."""
+    return ";".join(
+        f"{s['bin_id']}|{s['location']}|{s['lat']}|{s['lon']}|{s['fill']}"
+        for s in route
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Agent coroutines
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def bin_sensor_agent(bin_id: str):
-    """
-    Perceive → Decide → Act loop for a single Bin Sensor Agent.
-    Runs for CYCLES iterations, then stops.
-    """
+    """Perceive → Decide → Act loop. Runs for CYCLES iterations."""
     bin_data = BINS[bin_id]
     fill = bin_data["fill"]
 
@@ -101,22 +141,18 @@ async def bin_sensor_agent(bin_id: str):
         await asyncio.sleep(SENSE_PERIOD)
 
         # ── PERCEIVE ──────────────────────────────────────────────────
-        delta = random.randint(-5, 15)          # bins tend to fill up
+        delta = random.randint(-5, 15)
         fill  = max(0, min(100, fill + delta))
         bin_data["fill"] = fill
 
         # ── DECIDE ────────────────────────────────────────────────────
         if fill >= ALERT_THRESHOLD:
-            perf     = "BIN_ALERT"
-            priority = "HIGH"
-            colour   = RED
+            perf, priority, colour = "BIN_ALERT", "HIGH", RED
         else:
-            perf     = "BIN_STATUS"
-            priority = "NORMAL"
-            colour   = CYAN
+            perf, priority, colour = "BIN_STATUS", "NORMAL", CYAN
 
         # ── ACT ───────────────────────────────────────────────────────
-        msg = {
+        await planner_inbox.put({
             "performative": perf,
             "bin_id":       bin_id,
             "fill":         fill,
@@ -124,23 +160,23 @@ async def bin_sensor_agent(bin_id: str):
             "lat":          bin_data["lat"],
             "lon":          bin_data["lon"],
             "priority":     priority,
-        }
-        await planner_inbox.put(msg)
+        })
         print(f"{colour}[BinSensor:{bin_id}] Cycle {cycle}: fill={fill}% → {perf}{RESET}")
 
-    # Signal end of sensor stream
     await planner_inbox.put({"performative": "SENSOR_DONE", "bin_id": bin_id})
 
 
 async def route_planner_agent(num_sensors: int):
     """
-    Route Planning Agent — listens for bin messages and dispatches routes.
-    Stops after all sensors have sent SENSOR_DONE.
+    Route Planning Agent.
+    In Driver Mode, formats routes as human-readable text.
+    In Agent Mode, formats routes as pipe-separated machine strings.
     """
     bin_map: dict = {}
-    sensors_done = 0
+    sensors_done  = 0
+    mode_label    = "DRIVER MODE" if DRIVER_MODE else "AGENT MODE"
 
-    print(f"{YELLOW}[RoutePlanner] Agent started, waiting for bin data …{RESET}")
+    print(f"{YELLOW}[RoutePlanner] Agent started [{mode_label}] — waiting for bin data …{RESET}")
 
     while True:
         msg = await planner_inbox.get()
@@ -152,6 +188,17 @@ async def route_planner_agent(num_sensors: int):
                 print(f"{YELLOW}[RoutePlanner] All sensors done — shutting down.{RESET}")
                 await truck_inbox.put({"performative": "SHUTDOWN"})
                 break
+            continue
+
+        # Check for DONE reply from driver (driver mode only)
+        if DRIVER_MODE and msg["performative"] == "DRIVER_DONE":
+            bin_id = msg["bin_id"]
+            if bin_id in bin_map:
+                bin_map[bin_id]["fill"] = 0
+                print(
+                    f"{YELLOW}[RoutePlanner] Driver confirmed DONE {bin_id} "
+                    f"— belief base updated (fill → 0%).{RESET}"
+                )
             continue
 
         bin_map[msg["bin_id"]] = msg
@@ -167,16 +214,20 @@ async def route_planner_agent(num_sensors: int):
         )
 
         if dispatch:
-            candidates = [
-                b for b in bin_map.values()
-                if b["fill"] >= SCHEDULE_THRESHOLD
-            ]
+            candidates = [b for b in bin_map.values() if b["fill"] >= SCHEDULE_THRESHOLD]
             if candidates:
                 route = nearest_neighbour(candidates)
+
                 # ── ACT ───────────────────────────────────────────────
+                if DRIVER_MODE:
+                    route_body = format_route_human(route)
+                else:
+                    route_body = format_route_machine(route)
+
                 await truck_inbox.put({
                     "performative": "ROUTE_UPDATE",
                     "route":        route,
+                    "body":         route_body,
                 })
                 stops = [s["location"] for s in route]
                 print(
@@ -184,27 +235,24 @@ async def route_planner_agent(num_sensors: int):
                     f"{len(route)} stops: {stops}{RESET}"
                 )
 
-    # Drain COLLECTION_DONE messages until truck shuts down
+    # Drain confirmations until receiver signals done
     while True:
         msg = await done_inbox.get()
-        if msg["performative"] == "TRUCK_DONE":
+        if msg["performative"] in ("TRUCK_DONE", "DRIVER_DONE_ALL"):
             break
         if msg["performative"] == "COLLECTION_DONE":
             print(
-                f"{YELLOW}[RoutePlanner] ✔ Confirmed collection: "
-                f"{msg['bin_id']} at {msg['location']} "
-                f"[{msg['collected_at']}]{RESET}"
+                f"{YELLOW}[RoutePlanner] ✔ Confirmed: "
+                f"{msg['bin_id']} at {msg['location']} [{msg['collected_at']}]{RESET}"
             )
 
 
-async def waste_truck_agent():
-    """
-    Waste Truck Agent — receives routes and simulates collection.
-    """
-    collected: list[dict] = []
-    current_location = "Depot"
+# ── AGENT MODE: autonomous truck ──────────────────────────────────────────
 
-    print(f"{GREEN}[WasteTruck] Agent started, waiting for routes …{RESET}")
+async def waste_truck_agent():
+    """Autonomous Waste Truck Agent — used in Agent Mode."""
+    collected = []
+    print(f"{GREEN}[WasteTruck] Agent started (AGENT MODE) — waiting for routes …{RESET}")
 
     while True:
         msg = await truck_inbox.get()
@@ -217,14 +265,9 @@ async def waste_truck_agent():
         if msg["performative"] != "ROUTE_UPDATE":
             continue
 
-        # ── PERCEIVE ──────────────────────────────────────────────────
         route = msg["route"]
-        print(
-            f"{GREEN}[WasteTruck] New route: "
-            f"{[s['location'] for s in route]}{RESET}"
-        )
+        print(f"{GREEN}[WasteTruck] New route: {[s['location'] for s in route]}{RESET}")
 
-        # ── ACT: drive to each bin ─────────────────────────────────────
         for stop in route:
             print(
                 f"{GREEN}[WasteTruck] Driving to {stop['location']} "
@@ -233,13 +276,9 @@ async def waste_truck_agent():
             await asyncio.sleep(TRAVEL_SECONDS)
 
             collected_at = datetime.now().isoformat()
-            current_location = stop["location"]
             collected.append({**stop, "collected_at": collected_at})
+            print(f"{GREEN}{BOLD}[WasteTruck] ✔ Collected {stop['bin_id']} at {stop['location']}{RESET}")
 
-            print(f"{GREEN}{BOLD}[WasteTruck] ✔ Collected {stop['bin_id']} "
-                  f"at {stop['location']}{RESET}")
-
-            # ── ACT: send COLLECTION_DONE confirmation ─────────────────
             await done_inbox.put({
                 "performative": "COLLECTION_DONE",
                 "bin_id":       stop["bin_id"],
@@ -248,11 +287,90 @@ async def waste_truck_agent():
             })
 
         print(f"{GREEN}[WasteTruck] Route complete — returning to depot.{RESET}")
-        current_location = "Depot"
 
-    # Summary
+    _print_summary(collected, "AGENT MODE")
+
+
+# ── DRIVER MODE: simulated human driver ───────────────────────────────────
+
+async def simulated_driver():
+    """
+    Simulates a human truck driver receiving XMPP chat messages on their phone.
+
+    Prints the exact message the driver would see, then after a short delay
+    sends DONE bin_XXX replies back to the planner — just as a real driver
+    would type them.
+    """
+    collected = []
+    print(
+        f"{BLUE}[Driver] Logged in as waste_truck@xmpp.jp "
+        f"— waiting for route messages …{RESET}"
+    )
+
+    while True:
+        msg = await truck_inbox.get()
+
+        if msg["performative"] == "SHUTDOWN":
+            print(f"{BLUE}[Driver] System shutting down — end of shift.{RESET}")
+            await done_inbox.put({"performative": "DRIVER_DONE_ALL"})
+            break
+
+        if msg["performative"] != "ROUTE_UPDATE":
+            continue
+
+        # ── PERCEIVE: driver reads the chat message ────────────────────
+        route = msg["route"]
+        print(f"\n{BLUE}{BOLD}[Driver] 📱 New message from route_planner@xmpp.jp:{RESET}")
+        print(f"{BLUE}{'─'*55}")
+        print(msg["body"])
+        print(f"{'─'*55}{RESET}\n")
+
+        # ── ACT: driver travels to each stop and sends DONE replies ────
+        for stop in route:
+            print(
+                f"{BLUE}[Driver] 🚛 Driving to {stop['location']} "
+                f"(Bin {stop['bin_id']}, {stop['fill']}% full) …{RESET}"
+            )
+            await asyncio.sleep(TRAVEL_SECONDS)
+
+            collected_at = datetime.now().isoformat()
+            collected.append({**stop, "collected_at": collected_at})
+
+            print(
+                f"{BLUE}{BOLD}[Driver] ✔ Collected bin at "
+                f"{stop['location']}{RESET}"
+            )
+
+            # Simulate driver typing "DONE bin_XXX" in the chat app
+            await asyncio.sleep(REPLY_DELAY)
+            reply = f"DONE {stop['bin_id']}"
+            print(f"{BLUE}[Driver] 📱 Replying: \"{reply}\"{RESET}")
+
+            # Send DONE reply to planner's inbox (simulates XMPP reply)
+            await planner_inbox.put({
+                "performative": "DRIVER_DONE",
+                "bin_id":       stop["bin_id"],
+            })
+            # Also confirm to done_inbox for the summary drain
+            await done_inbox.put({
+                "performative": "COLLECTION_DONE",
+                "bin_id":       stop["bin_id"],
+                "location":     stop["location"],
+                "collected_at": collected_at,
+            })
+
+        print(f"{BLUE}[Driver] Route complete — returning to depot.{RESET}\n")
+
+    _print_summary(collected, "DRIVER MODE")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Summary helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _print_summary(collected: list, mode: str):
     print(f"\n{BOLD}{'═'*60}")
-    print(f"  SIMULATION COMPLETE — Collection Summary")
+    print(f"  SIMULATION COMPLETE [{mode}] — Collection Summary")
     print(f"{'═'*60}{RESET}")
     if collected:
         for c in collected:
@@ -272,9 +390,14 @@ async def main():
     truck_inbox   = asyncio.Queue()
     done_inbox    = asyncio.Queue()
 
+    mode_label = "DRIVER MODE — human driver receives routes" \
+                 if DRIVER_MODE else \
+                 "AGENT MODE  — autonomous truck agent"
+
     print(f"\n{BOLD}{'═'*60}")
     print(f"  Smart Waste Collection Agent System — Simulation")
-    print(f"  Agents: {len(BINS)} BinSensor | 1 RoutePlanner | 1 WasteTruck")
+    print(f"  {mode_label}")
+    print(f"  Bins: {len(BINS)}  |  Sense cycles: {CYCLES}")
     print(f"{'═'*60}{RESET}\n")
 
     sensor_tasks = [
@@ -284,7 +407,12 @@ async def main():
     planner_task = asyncio.create_task(
         route_planner_agent(len(BINS))
     )
-    truck_task = asyncio.create_task(waste_truck_agent())
+
+    # Choose truck coroutine based on mode
+    if DRIVER_MODE:
+        truck_task = asyncio.create_task(simulated_driver())
+    else:
+        truck_task = asyncio.create_task(waste_truck_agent())
 
     await asyncio.gather(*sensor_tasks, planner_task, truck_task)
 

@@ -39,7 +39,7 @@ class BinSensorAgent(Agent):
         self.bin_id = bin_id
         self.route_planner_jid = route_planner_jid
         # Initialise fill level randomly (simulating a real sensor)
-        self._fill_level = random.randint(60, 99)
+        self._fill_level = random.randint(20, 99)
 
     # ------------------------------------------------------------------ #
     #  Simulated hardware read — replace with real IoT SDK call           #
